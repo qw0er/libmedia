@@ -45,7 +45,7 @@ import {
 
 const RestExt = ['php', 'asp', 'aspx', 'jsp', 'do', 'pl']
 
-async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}) {
+async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}, signal?: AbortSignal) {
   const params: RequestInit = {
     method: 'GET',
     headers: {},
@@ -64,11 +64,7 @@ async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}) {
   if (httpOptions.referrerPolicy) {
     params.referrerPolicy = httpOptions.referrerPolicy
   }
-  let abortController: AbortController
-  if (typeof AbortController === 'function') {
-    abortController = new AbortController()
-    params.signal = abortController.signal
-  }
+  params.signal = signal
   const res = await fetch(url, params)
   if (res.ok && (res.status >= 200 && res.status <= 299)) {
     const reader = res.body.getReader()
@@ -85,9 +81,7 @@ async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}) {
         break
       }
     }
-    if (abortController) {
-      abortController.abort()
-    }
+    void reader.cancel().catch(() => {})
     if (buffers.length) {
       const buffer = buffers.length > 1 ? concatTypeArray(Uint8Array, buffers) : buffers[0]
       if (buffer.length) {
@@ -106,7 +100,7 @@ async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}) {
   return ''
 }
 
-export default async function analyzeUrlIOLoader(source: string, defaultExt: string = '', httpOptions: HttpOptions = {}) {
+export default async function analyzeUrlIOLoader(source: string, defaultExt: string = '', httpOptions: HttpOptions = {}, signal?: AbortSignal) {
   let type: IOType
   let ext: string = ''
   let info: Data = {
@@ -145,7 +139,7 @@ export default async function analyzeUrlIOLoader(source: string, defaultExt: str
     // 没有文件后缀，我们需要分析是不是 m3u8 和 mpd 文件
     // 这两种格式需要提前知道来创建指定的 ioloader
     if ((!ext || array.has(RestExt, ext)) && /^https?/.test(protocol)) {
-      ext = await analyzeUrlFileExt(source, httpOptions)
+      ext = await analyzeUrlFileExt(source, httpOptions, signal)
     }
 
     let defaultType: IOType = IOType.Fetch

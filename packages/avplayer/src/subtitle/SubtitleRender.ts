@@ -40,8 +40,11 @@ import {
   type AVCodecParameters,
   AVPacketPoolImpl,
   avRescaleQ2,
-  destroyAVPacket
+  destroyAVPacket,
+  unserializeAVPacket
 } from '@libmedia/avutil'
+
+import type { AVPacketSerialize } from '@libmedia/avutil'
 
 import {
   AV_MILLI_TIME_BASE_Q
@@ -373,7 +376,10 @@ export default class SubtitleRender {
     }
     this.pulling = true
     const currentPort = this.currentPort
-    const avpacket = await this.leftPorts.get(this.currentPort).request<pointer<AVPacketRef>>('pull')
+    const packet = await this.leftPorts.get(currentPort).request<pointer<AVPacketRef> | AVPacketSerialize>('pull')
+    const avpacket = typeof packet === 'object'
+      ? unserializeAVPacket(packet, this.avpacketPool?.alloc()) as pointer<AVPacketRef>
+      : packet
     if (avpacket === IOError.END) {
       logger.debug('SubtitleRender end')
       this.decoder?.flush()

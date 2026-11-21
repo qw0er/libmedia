@@ -287,6 +287,7 @@ async function compile(
       console.log(ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
     }
   })
+  return !emitResult.emitSkipped && !allDiagnostics.some((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error)
 }
 
 function parseCommandLine(configPath: string) {
@@ -910,6 +911,42 @@ async function buildAvrender() {
   printTaskLog(0, 'avrender', 'SUCCESS', 'built avrender completed')
 }
 
+async function buildAvplayerBrowser() {
+  const root = path.resolve(__dirname, '..')
+  const output = path.join(root, 'packages/avplayer/dist/browser')
+  for (const target of [['avplayer=1', 'esm=1', 'singleChunk=1'], ['pcm_worklet_processor=1']]) {
+    const result = spawnSync(process.execPath, [
+      '--import', 'tsx', 'node_modules/webpack/bin/webpack.js',
+      '--env', 'release=1', `dist=${output}`, ...target
+    ], { cwd: root, env: { ...process.env, NODE_ENV: 'production' }, stdio: 'inherit' })
+    if (result.error || result.status !== 0) {
+      throw result.error ?? new Error(`Browser runtime build failed: ${target[0]}`)
+    }
+  }
+  await buildAvplayerBrowserTypes()
+}
+
+async function buildAvplayerBrowserTypes() {
+  const root = path.resolve(__dirname, '..')
+  const config = parseCommandLine(path.join(root, 'packages/avplayer/tsconfig.d.json'))
+  const output = path.join(root, 'packages/avplayer/dist/browser-types')
+  config.options.rootDir = root
+  config.options.outDir = output
+  const built = await compile(config.fileNames, config.options, (fileName, data) => {
+    fs.mkdirSync(path.dirname(fileName), { recursive: true })
+    fs.writeFileSync(fileName, formatDeclarationFileImport(data))
+  }, false)
+  if (!built) {
+    throw new Error('Could not build the AVPlayer browser declarations')
+  }
+  fs.writeFileSync(path.join(output, 'tsconfig.json'), JSON.stringify({
+    compilerOptions: { paths: {
+      ...config.options.paths,
+      '@qw0er/libmedia-avplayer': ['./packages/avplayer/src/AVPlayer.d.ts']
+    } }
+  }, null, 2) + '\n')
+}
+
 async function buildAvplayer() {
   printTaskLog(0, 'AVPlayer', 'START', 'starting built AVPlayer')
   fs.rmSync(path.resolve(__dirname, '../packages/avplayer/dist'), { recursive: true, force: true })
@@ -1132,6 +1169,9 @@ switch (argv.package) {
     break
   case 'avpipeline':
     buildAvpipeline()
+    break
+  case 'avplayer-browser':
+    buildAvplayerBrowser()
     break
   case 'avplayer':
     buildAvplayer()

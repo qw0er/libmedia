@@ -243,6 +243,8 @@ export interface DRMSystemOptions {
   ) => Promise<BufferSource>
 }
 
+type WasmSource = string | ArrayBuffer | WebAssemblyResource | undefined
+
 export interface AVPlayerOptions {
   /**
    * dom 挂载元素
@@ -264,7 +266,14 @@ export interface AVPlayerOptions {
    * @param mediaType 
    * @returns 
    */
-  getWasm?: (type: 'decoder' | 'resampler' | 'stretchpitcher', codecId?: AVCodecID, mediaType?: AVMediaType) => string | ArrayBuffer | WebAssemblyResource
+  getWasm?: (
+    type: 'decoder' | 'resampler' | 'stretchpitcher',
+    codecId?: AVCodecID,
+    mediaType?: AVMediaType,
+    path?: string
+  ) => WasmSource | Promise<WasmSource>
+  /** Same-origin modules for the message-port and shared-memory audio worklets. */
+  audioWorkletUrls?: { messagePort: string, sharedMemory: string }
   /**
    * 是否是直播（已弃用，请在 load 方法中传递参数）
    * @deprecated
@@ -323,7 +332,7 @@ export interface AVPlayerOptions {
   /**
    * 自定义查找播放流回调
    */
-  findBestStream?: (streams: AVStreamInterface[], mediaType: AVMediaType) => AVStreamInterface
+  findBestStream?: (streams: AVStreamInterface[], mediaType: AVMediaType) => AVStreamInterface | undefined
   /**
    * 配置 audioWorklet 的缓冲区大小，以 128 采样为单位
    * 某些机器上 audioWorklet 线程与其他线程通信延迟较大会导致音频播放卡顿，此时可以调大这个
@@ -338,6 +347,8 @@ export interface AVPlayerOptions {
 }
 
 export interface AVPlayerLoadOptions {
+  /** Aborts this load and subsequent HTTP reads for the media source. */
+  signal?: AbortSignal
   /**
    * 源扩展名
    * 强制指定扩展名，对没有扩展名的 url 链接使用
@@ -672,6 +683,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
   private subtitleRender: SubtitleRender
 
   private externalSubtitleTasks: ExternalSubtitleTask[]
+  private removeFetchAbortListeners = new Map<string, () => void>()
 
   private changingStreamPending: {
     pending: PromisePending
@@ -765,8 +777,9 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
    * @hidden
    */
   private findBestStream(streams: AVStreamInterface[], mediaType: AVMediaType, isMSE: boolean = false) {
-    if (this.options.findBestStream) {
-      return this.options.findBestStream(streams, mediaType)
+    const preferred = this.options.findBestStream?.(streams, mediaType)
+    if (preferred) {
+      return preferred
     }
     const ss = streams.filter((stream) => {
       return stream.codecpar.codecType === mediaType
@@ -1151,8 +1164,12 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
 
     if (this.subtitleRender) {
       for (let i = 0; i < this.externalSubtitleTasks.length; i++) {
-        await AVPlayer.DemuxerThread.seek(this.externalSubtitleTasks[0].taskId, timestamp, AVSeekFlags.FRAME)
+        await AVPlayer.DemuxerThread.seek(this.externalSubtitleTasks[i].taskId, timestamp, AVSeekFlags.FRAME)
       }
+    }
+
+    if (seekedTimestamp < 0n) {
+      return false
     }
 
     this.fire(eventType.TIME, [timestamp])
@@ -1234,6 +1251,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
       this.subtitleRender.reset()
       this.subtitleRender.start()
     }
+    return true
   }
 
   private async handleEnded() {
@@ -1304,7 +1322,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     }
 
     const wasmUrl = this.options.getWasm
-      ? this.options.getWasm(type, codecId, mediaType)
+      ? await this.options.getWasm(type, codecId, mediaType, getWasmUrl('', type, codecId))
       : getWasmUrl(
         this.options.wasmBaseUrl ?? `https://cdn.jsdelivr.net/gh/zhaohappy/libmedia@${defined(VERSION).split('-')[0].replace(/^[v|n]/, '')}/dist`,
         type,
@@ -1384,7 +1402,22 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
    * @param externalSubtitle 
    * @returns 
    */
-  public async loadExternalSubtitle(externalSubtitle: ExternalSubtitle) {
+  private watchFetchAbort(taskId: string, signal?: AbortSignal, deadline?: AbortSignal) {
+    const cancel = () => {
+      void AVPlayer.IOThread.cancelFetch(taskId).catch(() => {})
+    }
+    signal?.addEventListener('abort', cancel, { once: true })
+    deadline?.addEventListener('abort', cancel, { once: true })
+    this.removeFetchAbortListeners.set(taskId, () => {
+      signal?.removeEventListener('abort', cancel)
+      deadline?.removeEventListener('abort', cancel)
+    })
+    return () => deadline?.removeEventListener('abort', cancel)
+  }
+
+  public async loadExternalSubtitle(externalSubtitle: ExternalSubtitle, signal?: AbortSignal, deadline?: AbortSignal) {
+    signal?.throwIfAborted()
+    deadline?.throwIfAborted()
 
     if (this.status === AVPlayerStatus.DESTROYING || this.status === AVPlayerStatus.DESTROYED) {
       logger.fatal('player has already destroyed')
@@ -1409,123 +1442,145 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
       ioloader2DemuxerChannel
     }, externalSubtitle)
 
-    let ext = ''
-    let ret = 0
+    const stopDeadline = is.string(externalSubtitle.source)
+      ? this.watchFetchAbort(taskId, signal, deadline)
+      : undefined
 
-    let flags = 0
+    try {
+      let ext = ''
+      let ret = 0
 
-    if (is.string(externalSubtitle.source)) {
-      flags |= IOFlags.NETWORK
-      ext = urlUtils.parse(externalSubtitle.source).file.split('.').pop()
-      ret = await AVPlayer.IOThread.registerTask
-        .transfer(ioloader2DemuxerChannel.port1)
-        .invoke({
-          type: IOType.Fetch,
-          info: {
-            url: externalSubtitle.source
-          },
-          range: {
-            from: -1,
-            to: -1
-          },
-          taskId: taskId,
-          options: {
-            isLive: this.isLive_
-          },
-          rightPort: ioloader2DemuxerChannel.port1,
-          stats: addressof(this.GlobalData.stats)
-        })
-    }
-    else {
-      ext = externalSubtitle.source.name.split('.').pop()
-      ret = await AVPlayer.IOThread.registerTask
-        .transfer(ioloader2DemuxerChannel.port1)
-        .invoke({
-          type: IOType.File,
-          info: {
-            file: externalSubtitle.source
-          },
-          range: {
-            from: -1,
-            to: -1
-          },
-          taskId: taskId,
-          options: {
-            isLive: this.isLive_
-          },
-          rightPort: ioloader2DemuxerChannel.port1,
-          stats: addressof(this.GlobalData.stats)
-        })
-    }
+      let flags = 0
 
-    if (ret < 0) {
-      logger.fatal(`register io task failed, ret: ${ret}, taskId: ${this.taskId}`)
-    }
-
-    await AVPlayer.DemuxerThread.registerTask.transfer(ioloader2DemuxerChannel.port2)
-      .invoke({
-        taskId: taskId,
-        leftPort: ioloader2DemuxerChannel.port2,
-        format: Ext2Format[ext],
-        stats: nullptr,
-        isLive: false,
-        flags,
-        avpacketList: addressof(this.GlobalData.avpacketList),
-        avpacketListMutex: addressof(this.GlobalData.avpacketListMutex)
-      })
-
-    ret = await AVPlayer.DemuxerThread.openStream(taskId)
-    if (ret < 0) {
-      logger.fatal(`open external subtitle failed, ret: ${ret}, taskId: ${taskId}`)
-    }
-    let formatContext = await AVPlayer.DemuxerThread.analyzeStreams(taskId)
-    if (is.number(formatContext)) {
-      logger.fatal(`analyze stream failed, ret: ${formatContext}`)
-      return
-    }
-    else if (!formatContext.streams.length) {
-      logger.fatal('not found any stream')
-    }
-
-    const stream = formatContext.streams[0]
-
-    this.formatContext.streams.push(stream)
-
-    externalSubtitleTask.streamId = stream.id
-
-    if (externalSubtitle.lang) {
-      stream.metadata[AVStreamMetadataKey.LANGUAGE] = externalSubtitle.lang
-    }
-    if (externalSubtitle.title) {
-      stream.metadata[AVStreamMetadataKey.TITLE] = externalSubtitle.title
-    }
-
-    const handleStatus = this.status === AVPlayerStatus.PAUSED
-      || this.status === AVPlayerStatus.PLAYED
-      || this.status === AVPlayerStatus.SEEKING
-      || this.status === AVPlayerStatus.CHANGING
-
-    if (handleStatus) {
-      await AVPlayer.DemuxerThread.seek(taskId, this.currentTime, AVSeekFlags.FRAME)
-    }
-
-    if (defined(ENABLE_SUBTITLE_RENDER)) {
-      if (handleStatus && !this.subtitleRender) {
-        await this.createSubtitleRender(stream, taskId)
-        this.subtitleRender.start()
+      if (is.string(externalSubtitle.source)) {
+        flags |= IOFlags.NETWORK
+        ext = urlUtils.parse(externalSubtitle.source).file.split('.').pop()
+        ret = await AVPlayer.IOThread.registerTask
+          .transfer(ioloader2DemuxerChannel.port1)
+          .invoke({
+            type: IOType.Fetch,
+            info: {
+              url: externalSubtitle.source
+            },
+            range: {
+              from: -1,
+              to: -1
+            },
+            taskId: taskId,
+            options: {
+              isLive: this.isLive_
+            },
+            rightPort: ioloader2DemuxerChannel.port1,
+            stats: addressof(this.GlobalData.stats)
+          })
       }
-      else if (this.subtitleRender) {
-        await AVPlayer.DemuxerThread.connectStreamTask.transfer(this.subtitleRender.getDemuxerPort(taskId))
-          .invoke(taskId, stream.index, this.subtitleRender.getDemuxerPort(taskId))
+      else {
+        ext = externalSubtitle.source.name.split('.').pop()
+        ret = await AVPlayer.IOThread.registerTask
+          .transfer(ioloader2DemuxerChannel.port1)
+          .invoke({
+            type: IOType.File,
+            info: {
+              file: externalSubtitle.source
+            },
+            range: {
+              from: -1,
+              to: -1
+            },
+            taskId: taskId,
+            options: {
+              isLive: this.isLive_
+            },
+            rightPort: ioloader2DemuxerChannel.port1,
+            stats: addressof(this.GlobalData.stats)
+          })
+      }
+
+      if (ret < 0) {
+        logger.fatal(`register io task failed, ret: ${ret}, taskId: ${this.taskId}`)
+      }
+
+      await AVPlayer.DemuxerThread.registerTask.transfer(ioloader2DemuxerChannel.port2)
+        .invoke({
+          taskId: taskId,
+          leftPort: ioloader2DemuxerChannel.port2,
+          format: Ext2Format[ext],
+          stats: nullptr,
+          isLive: false,
+          flags,
+          avpacketList: addressof(this.GlobalData.avpacketList),
+          avpacketListMutex: addressof(this.GlobalData.avpacketListMutex)
+        })
+
+      ret = await AVPlayer.DemuxerThread.openStream(taskId)
+      if (ret < 0) {
+        logger.fatal(`open external subtitle failed, ret: ${ret}, taskId: ${taskId}`)
+      }
+      let formatContext = await AVPlayer.DemuxerThread.analyzeStreams(taskId)
+      if (is.number(formatContext)) {
+        logger.fatal(`analyze stream failed, ret: ${formatContext}`)
+        return
+      }
+      else if (!formatContext.streams.length) {
+        logger.fatal('not found any stream')
+      }
+
+      signal?.throwIfAborted()
+      deadline?.throwIfAborted()
+      stopDeadline?.()
+
+      const stream = formatContext.streams[0]
+
+      this.formatContext.streams.push(stream)
+
+      externalSubtitleTask.streamId = stream.id
+
+      if (externalSubtitle.lang) {
+        stream.metadata[AVStreamMetadataKey.LANGUAGE] = externalSubtitle.lang
+      }
+      if (externalSubtitle.title) {
+        stream.metadata[AVStreamMetadataKey.TITLE] = externalSubtitle.title
+      }
+
+      const handleStatus = this.status === AVPlayerStatus.PAUSED
+        || this.status === AVPlayerStatus.PLAYED
+        || this.status === AVPlayerStatus.SEEKING
+        || this.status === AVPlayerStatus.CHANGING
+
+      if (handleStatus) {
+        await AVPlayer.DemuxerThread.seek(taskId, this.currentTime, AVSeekFlags.FRAME)
+      }
+
+      if (defined(ENABLE_SUBTITLE_RENDER)) {
+        if (handleStatus && !this.subtitleRender) {
+          await this.createSubtitleRender(stream, taskId)
+          this.subtitleRender.start()
+        }
+        else if (this.subtitleRender) {
+          await AVPlayer.DemuxerThread.connectStreamTask.transfer(this.subtitleRender.getDemuxerPort(taskId))
+            .invoke(taskId, stream.index, this.subtitleRender.getDemuxerPort(taskId))
+        }
+      }
+
+      await AVPlayer.DemuxerThread.startDemux(taskId, false, 10)
+      this.externalSubtitleTasks.push(externalSubtitleTask)
+
+      this.fire(eventType.STREAM_UPDATE)
+
+      return 0
+    }
+    finally {
+      stopDeadline?.()
+      if (!this.externalSubtitleTasks.includes(externalSubtitleTask)) {
+        if (externalSubtitleTask.streamId !== -1) {
+          this.formatContext.streams = this.formatContext.streams.filter((stream) => stream.id !== externalSubtitleTask.streamId)
+        }
+        this.removeFetchAbortListeners.get(taskId)?.()
+        this.removeFetchAbortListeners.delete(taskId)
+        await AVPlayer.DemuxerThread.unregisterTask(taskId)
+        await AVPlayer.IOThread.unregisterTask(taskId)
       }
     }
-
-    await AVPlayer.DemuxerThread.startDemux(taskId, false, 10)
-    this.externalSubtitleTasks.push(externalSubtitleTask)
-
-    this.fire(eventType.STREAM_UPDATE)
-
-    return 0
   }
 
   /**
@@ -1579,7 +1634,11 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
 
     if (is.string(source)) {
       flags |= IOFlags.NETWORK
-      let { info, type, ext } = await analyzeUrlIOLoader(source, options.ext, options.http)
+      let { info, type, ext } = await analyzeUrlIOLoader(source, options.ext, options.http, options.signal)
+      options.signal?.throwIfAborted()
+      if (type === IOType.Fetch) {
+        this.watchFetchAbort(this.taskId, options.signal)
+      }
       this.ext = ext
 
       // 注册一个 url io 任务
@@ -2211,6 +2270,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
         this.video.muted = true
       }
       (this.video || this.audio).playbackRate = this.playRate
+      this.setVolume(this.volume, true)
     }
   }
 
@@ -2307,7 +2367,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     if (audioStream && options.audio) {
       this.fire(eventType.PROGRESS, [AVPlayerProgress.LOAD_AUDIO_DECODER, audioStream])
       this.selectedAudioStream = audioStream
-      await AVPlayer.startAudioPipeline(this.options.enableWorker)
+      await AVPlayer.startAudioPipeline(this.options.enableWorker, this.options.audioWorkletUrls)
 
       if (AVPlayer.audioContext.state === 'suspended'
         // @ts-ignore
@@ -2628,7 +2688,9 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
         return
       }
       logger.info('replay to 0n because of player status is ended')
-      await this.replayTo(0n)
+      if (!await this.replayTo(0n)) {
+        throw new Error('Could not replay the source')
+      }
       this.status = AVPlayerStatus.PLAYED
       this.fire(eventType.PLAYED)
       return
@@ -3009,6 +3071,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
       this.subtitleRender.reset()
       this.subtitleRender.start()
     }
+    return seekedTimestamp >= 0n ? (seekedTimestamp > timestamp ? seekedTimestamp : timestamp) : null
   }
 
   /**
@@ -3017,7 +3080,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
    * 
    * @param timestamp 毫秒
    */
-  public async seek(timestamp: int64) {
+  public async seek(timestamp: bigint): Promise<bigint | null | undefined> {
 
     logger.info(`call seek, timestamp: ${timestamp}, taskId: ${this.taskId}`)
 
@@ -3045,16 +3108,28 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
       else if (this.selectedAudioStream) {
         streamIndex = this.selectedAudioStream.index
       }
-      if (this.lastStatus === AVPlayerStatus.ENDED) {
-        await this.replayTo(timestamp)
-        this.status = AVPlayerStatus.PLAYED
-        this.fire(eventType.SEEKED)
-        this.fire(eventType.PLAYED)
-      }
-      else {
-        await this.doSeek(timestamp, streamIndex)
+      try {
+        if (this.lastStatus === AVPlayerStatus.ENDED) {
+          if (!await this.replayTo(timestamp)) {
+            return null
+          }
+          this.status = AVPlayerStatus.PLAYED
+          this.fire(eventType.SEEKED)
+          this.fire(eventType.PLAYED)
+          return timestamp
+        }
+
+        const position = await this.doSeek(timestamp, streamIndex)
         this.status = this.lastStatus
-        this.fire(eventType.SEEKED)
+        if (position !== null) {
+          this.fire(eventType.SEEKED)
+        }
+        return position
+      }
+      finally {
+        if (this.status === AVPlayerStatus.SEEKING) {
+          this.status = this.lastStatus
+        }
       }
     }
     else {
@@ -3298,6 +3373,8 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
 
     this.changingStreamPending.length = 0
 
+    this.removeFetchAbortListeners.forEach((remove) => remove())
+    this.removeFetchAbortListeners.clear()
     this.status = AVPlayerStatus.STOPPED
 
     resolve()
@@ -4470,7 +4547,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     })
   }
 
-  static async startAudioContext() {
+  static async startAudioContext(workletUrls?: AVPlayerOptions['audioWorkletUrls']) {
     if (!AVPlayer.audioContext) {
       AVPlayer.audioContext = new (AudioContext || webkitAudioContext)()
     }
@@ -4482,22 +4559,23 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     })
 
     if (support.audioWorklet) {
-      if (defined(ENV_WEBPACK) && !defined(ENV_CSP)) {
+      const sharedMemory = defined(ENABLE_THREADS)
+        && cheapConfig.USE_THREADS
+        && (!browser.safari || browser.checkVersion(browser.version, '16.1', true))
+        && (!os.ios || browser.checkVersion(os.version, '16.1', true))
+      if (workletUrls) {
+        await AVPlayer.audioContext.audioWorklet.addModule(sharedMemory ? workletUrls.sharedMemory : workletUrls.messagePort)
+      }
+      else if (defined(ENV_WEBPACK) && !defined(ENV_CSP)) {
         await registerProcessor(
           AVPlayer.audioContext,
-          defined(ENABLE_THREADS)
-          && cheapConfig.USE_THREADS
-          && (!browser.safari || browser.checkVersion(browser.version, '16.1', true))
-          && (!os.ios || browser.checkVersion(os.version, '16.1', true))
+          sharedMemory
             ? require.resolve('../../avrender/src/pcm/AudioSourceWorkletProcessor2')
             : require.resolve('../../avrender/src/pcm/AudioSourceWorkletProcessor')
         )
       }
       else {
-        await AVPlayer.audioContext.audioWorklet.addModule(defined(ENABLE_THREADS)
-          && cheapConfig.USE_THREADS
-          && (!browser.safari || browser.checkVersion(browser.version, '16.1', true))
-          && (!os.ios || browser.checkVersion(os.version, '16.1', true))
+        await AVPlayer.audioContext.audioWorklet.addModule(sharedMemory
           ? new URL('../../avrender/dist/AudioSourceWorkletProcessor2Worklet.js', import.meta.url)
           : new URL('../../avrender/dist/AudioSourceWorkletProcessorWorklet.js', import.meta.url))
       }
@@ -4507,14 +4585,13 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
   /**
    * @hidden
    */
-  static async startAudioPipeline(enableWorker: boolean = true) {
+  static async startAudioPipeline(enableWorker: boolean = true, workletUrls?: AVPlayerOptions['audioWorkletUrls']) {
     if (AVPlayer.AudioThreadReady) {
       return AVPlayer.AudioThreadReady
     }
 
-    return AVPlayer.AudioThreadReady = new Promise(async (resolve) => {
-
-      await AVPlayer.startAudioContext()
+    return AVPlayer.AudioThreadReady = (async () => {
+      await AVPlayer.startAudioContext(workletUrls)
 
       if (cheapConfig.USE_THREADS || !support.worker || !enableWorker || !defined(ENABLE_WORKER_PROXY)) {
         AVPlayer.AudioDecoderThread = await createThreadFromClass(AudioDecodePipeline, {
@@ -4534,8 +4611,7 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
         AVPlayer.AudioDecoderThread = AVPlayer.AudioPipelineProxy.AudioDecodePipeline as Thread<AudioDecodePipeline>
         AVPlayer.AudioRenderThread = AVPlayer.AudioPipelineProxy.AudioRenderPipeline as Thread<AudioRenderPipeline>
       }
-      resolve()
-    })
+    })()
   }
 
   /**

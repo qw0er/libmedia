@@ -247,6 +247,13 @@ export default class IOPipeline extends Pipeline {
     }
   }
 
+  public async cancelFetch(taskId: string) {
+    const loader = this.tasks.get(taskId)?.ioLoader
+    if (loader instanceof FetchIOLoader) {
+      loader.cancelFetch()
+    }
+  }
+
   public async getDuration(taskId: string) {
     const task = this.tasks.get(taskId)
     if (task) {

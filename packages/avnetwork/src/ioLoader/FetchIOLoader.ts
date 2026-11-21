@@ -72,6 +72,8 @@ export default class FetchIOLoader extends IOLoader {
 
   private aborted: boolean
 
+  private fetchCancelled = false
+
   private bandwidth: number
 
   private delay: number
@@ -81,6 +83,9 @@ export default class FetchIOLoader extends IOLoader {
   }
 
   private async getTotalSize(method: string, headers: Data = {}) {
+    if (this.fetchCancelled) {
+      return 0
+    }
     const params: RequestInit = {
       method: method,
       headers: {},
@@ -144,6 +149,9 @@ export default class FetchIOLoader extends IOLoader {
 
   public async open(info: FetchInfo, range: Range = { from: 0, to: -1 }) {
 
+    if (this.fetchCancelled) {
+      return IOError.END
+    }
     this.info = info
     this.range = range
 
@@ -196,6 +204,9 @@ export default class FetchIOLoader extends IOLoader {
       }
     }
 
+    if (this.fetchCancelled) {
+      return IOError.END
+    }
     this.status = IOLoaderStatus.BUFFERING
 
     return 0
@@ -294,10 +305,13 @@ export default class FetchIOLoader extends IOLoader {
       }
       else {
         this.status = IOLoaderStatus.ERROR
-        logger.fatal(`FetchStreamLoader: Http code invalid, ${res.status} ${res.statusText}`)
+        logger.error(`Media HTTP request failed, status: ${res.status}`)
       }
     }
     catch (error) {
+      if (this.fetchCancelled) {
+        return
+      }
       if (this.retryCount < this.options.retryCount && (!this.options.isLive || !this.receivedLength)) {
         this.retryCount++
         this.status = IOLoaderStatus.CONNECTING
@@ -311,13 +325,17 @@ export default class FetchIOLoader extends IOLoader {
         return this.openReader()
       }
       else {
-        logger.fatal(`FetchStreamLoader: exception ${error.message}`)
+        this.status = IOLoaderStatus.ERROR
+        logger.error('Media fetch failed')
       }
     }
   }
 
   private async readInterval(buffer: Uint8ArrayInterface, preLen: int32 = 0): Promise<number> {
 
+    if (this.fetchCancelled) {
+      return IOError.END
+    }
     let pos = 0
 
     while (this.buffers.length && pos < buffer.length) {
@@ -346,9 +364,26 @@ export default class FetchIOLoader extends IOLoader {
       if (this.aborted) {
         return IOError.END
       }
+      if (!this.reader) {
+        return IOError.NETWORK_ERROR
+      }
     }
 
-    const { value, done } = await this.reader.read()
+    let result: ReadableStreamReadResult<Uint8Array>
+    try {
+      result = await this.reader.read()
+    }
+    catch (error) {
+      if (this.fetchCancelled) {
+        return IOError.END
+      }
+      throw error
+    }
+
+    if (this.fetchCancelled) {
+      return IOError.END
+    }
+    const { value, done } = result
 
     if (done) {
       if (this.contentLength !== undefined && (this.receivedLength + this.range.from) < this.endBytes + 1) {
@@ -399,6 +434,9 @@ export default class FetchIOLoader extends IOLoader {
   }
 
   public async seek(pos: int64) {
+    if (this.fetchCancelled) {
+      return IOError.END
+    }
 
     if (!this.supportRange) {
       return errorType.OPERATE_NOT_SUPPORT
@@ -408,6 +446,9 @@ export default class FetchIOLoader extends IOLoader {
     }
 
     await this.abort()
+    if (this.fetchCancelled) {
+      return IOError.END
+    }
     this.aborted = false
     this.receivedLength = Number(pos) - this.range.from
     this.startBytes = Number(pos)
@@ -427,6 +468,13 @@ export default class FetchIOLoader extends IOLoader {
       return 0n
     }
     return static_cast<int64>(this.contentLength || 0)
+  }
+
+  /** Permanently cancels this loader, including requests waiting for headers. */
+  public cancelFetch() {
+    this.fetchCancelled = true
+    this.abortSleep()
+    this.abortController?.abort()
   }
 
   public abortSleep() {
