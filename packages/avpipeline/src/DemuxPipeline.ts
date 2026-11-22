@@ -39,6 +39,7 @@ import {
   AVPacketSideDataType,
   avRescaleQ2,
   NOPTS_VALUE,
+  NOPTS_VALUE_BIGINT,
   type AVStreamGroup,
   type AVStreamGroupInterface,
   AVDisposition,
@@ -574,31 +575,82 @@ export default class DemuxPipeline extends Pipeline {
     }
   }
 
-  /** Read ASS dialogue from an independent demux task that has not started playback. */
-  public async readEmbeddedAssDialogue(taskId: string, streamIndex: number): Promise<string | undefined> {
+  /** Read subtitle packets from an independent demux task before playback starts. */
+  private async readEmbeddedSubtitle(
+    taskId: string,
+    streamIndex: number,
+    codecs: AVCodecID[],
+    consume: (packet: pointer<AVPacketRef>) => void
+  ): Promise<boolean> {
     const task = this.tasks.get(taskId)
-    if (!task || task.loop || task.realFormat !== AVFormat.MATROSKA) return
+    if (!task || task.loop || task.realFormat !== AVFormat.MATROSKA) return false
     const stream = task.formatContext.getStreamByIndex(streamIndex)
     if (!stream || stream.codecpar.codecType !== AVMediaType.AVMEDIA_TYPE_SUBTITLE
-      || (stream.codecpar.codecId !== AVCodecID.AV_CODEC_ID_ASS && stream.codecpar.codecId !== AVCodecID.AV_CODEC_ID_SSA)) {
-      return
+      || !codecs.includes(stream.codecpar.codecId)) {
+      return false
     }
 
     const packet = task.avpacketPool.alloc()
-    const dialogue: string[] = []
     try {
       while (!(task.ioReader.flags & IOFlags.ABORT)) {
         const result = await demux.readAVPacket(task.formatContext, packet)
-        if (result === IOError.END) return dialogue.join('\n')
-        if (result < 0) return
+        if (result === IOError.END) return true
+        if (result < 0) return false
         if (packet.streamIndex === streamIndex) {
-          dialogue.push(text.decode(getAVPacketData(packet)))
+          consume(packet)
         }
       }
     }
     finally {
       task.avpacketPool.release(packet)
     }
+    return false
+  }
+
+  public async readEmbeddedAssDialogue(taskId: string, streamIndex: number): Promise<string | undefined> {
+    const dialogue: string[] = []
+    const read = await this.readEmbeddedSubtitle(taskId, streamIndex, [AVCodecID.AV_CODEC_ID_ASS, AVCodecID.AV_CODEC_ID_SSA], (packet) => {
+      dialogue.push(text.decode(getAVPacketData(packet)))
+    })
+    if (read) return dialogue.join('\n')
+  }
+
+  public async readEmbeddedPgs(taskId: string, streamIndex: number): Promise<Uint8Array | undefined> {
+    const segments: Uint8Array[] = []
+    const timeBase = { num: 1, den: 90000 }
+    let size = 0
+    const read = await this.readEmbeddedSubtitle(taskId, streamIndex, [AVCodecID.AV_CODEC_ID_HDMV_PGS_SUBTITLE], (packet) => {
+      const data = getAVPacketData(packet)
+      const pts = Number(avRescaleQ2(bigint.max(packet.pts, 0n), addressof(packet.timeBase), timeBase) & 0xffffffffn)
+      const dts = packet.dts === NOPTS_VALUE_BIGINT
+        ? 0
+        : Number(avRescaleQ2(bigint.max(packet.dts, 0n), addressof(packet.timeBase), timeBase) & 0xffffffffn)
+
+      // SUP prefixes each PGS segment with "PG" and two 90 kHz timestamps.
+      for (let offset = 0; offset < data.length;) {
+        if (data.length - offset < 3) throw new Error('Incomplete PGS segment header')
+        const length = 3 + (data[offset + 1] << 8) + data[offset + 2]
+        if (length > data.length - offset) throw new Error('Incomplete PGS segment payload')
+
+        const segment = new Uint8Array(10 + length)
+        const header = new DataView(segment.buffer)
+        header.setUint16(0, 0x5047)
+        header.setUint32(2, pts)
+        header.setUint32(6, dts)
+        segment.set(data.subarray(offset, offset + length), 10)
+        segments.push(segment)
+        size += segment.length
+        offset += length
+      }
+    })
+    if (!read) return
+    const sup = new Uint8Array(size)
+    let offset = 0
+    for (const segment of segments) {
+      sup.set(segment, offset)
+      offset += segment.length
+    }
+    return sup
   }
 
   public async analyzeStreams(taskId: string): Promise<AVFormatContextInterface | int32> {

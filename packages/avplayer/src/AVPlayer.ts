@@ -3139,28 +3139,44 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     }
   }
 
-  private getEmbeddedAssStream(id: number) {
+  private getEmbeddedSubtitleStream(id: number) {
     if (this.formatContext?.format !== AVFormat.MATROSKA || this.isLive_
       || (typeof this.source !== 'string' && !(this.source instanceof File))
       || this.externalSubtitleTasks.some((task) => task.streamId === id)) {
       return
     }
     return this.formatContext.streams.find((stream) => stream.id === id
-      && stream.codecpar.codecType === AVMediaType.AVMEDIA_TYPE_SUBTITLE
-      && (stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_ASS || stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_SSA)
-      && stream.codecpar.extradataSize > 0)
+      && stream.codecpar.codecType === AVMediaType.AVMEDIA_TYPE_SUBTITLE)
+  }
+
+  private getEmbeddedAssStream(id: number) {
+    const stream = this.getEmbeddedSubtitleStream(id)
+    if (stream && (stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_ASS || stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_SSA)
+      && stream.codecpar.extradataSize > 0) return stream
   }
 
   public canLoadEmbeddedAss(id: number): boolean {
     return !!this.getEmbeddedAssStream(id)
   }
 
+  public canLoadEmbeddedPgs(id: number): boolean {
+    const stream = this.getEmbeddedSubtitleStream(id)
+    return !!stream && stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_HDMV_PGS_SUBTITLE
+  }
+
+  /** Read an embedded PGS track as SUP bytes on an independent demux task. */
+  public async loadEmbeddedPgs(id: number, options: Pick<AVPlayerLoadOptions, 'http' | 'signal'> = {}) {
+    options.signal?.throwIfAborted()
+    const track = this.getEmbeddedSubtitleStream(id)
+    if (!track || track.codecpar.codecId !== AVCodecID.AV_CODEC_ID_HDMV_PGS_SUBTITLE) return
+    return this.withSubtitleReader(options, (taskId) => AVPlayer.DemuxerThread.readEmbeddedPgs(taskId, track.index))
+  }
+
   /** Read the selected subtitle without seeking or consuming the playing demux task. */
-  public async loadEmbeddedAss(id: number, { http, signal }: Pick<AVPlayerLoadOptions, 'http' | 'signal'> = {}) {
-    signal?.throwIfAborted()
+  public async loadEmbeddedAss(id: number, options: Pick<AVPlayerLoadOptions, 'http' | 'signal'> = {}) {
+    options.signal?.throwIfAborted()
     const track = this.getEmbeddedAssStream(id)
-    const source = this.source
-    if (!track || (typeof source !== 'string' && !(source instanceof File))) return
+    if (!track) return
 
     const header = text.decode(mapUint8Array(track.codecpar.extradata, reinterpret_cast<size>(track.codecpar.extradataSize)))
     const fonts: Uint8Array[] = []
@@ -3173,16 +3189,25 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
       }
     }
 
+    const dialogue = await this.withSubtitleReader(options, (taskId) => AVPlayer.DemuxerThread.readEmbeddedAssDialogue(taskId, track.index))
+    if (dialogue !== undefined) return { script: `${header}\n${dialogue}`, fonts }
+  }
+
+  private async withSubtitleReader<T>(
+    { http, signal }: Pick<AVPlayerLoadOptions, 'http' | 'signal'>,
+    read: (taskId: string) => Promise<T>
+  ): Promise<T | undefined> {
+    const source = this.source
+    if (typeof source !== 'string' && !(source instanceof File)) return
     const reader = new AVPlayer({ container: document.createElement('div'), enableWorker: this.options.enableWorker })
     const cancel = () => { void AVPlayer.DemuxerThread.stop(reader.taskId).catch(() => {}) }
     try {
       await reader.load(source, { ext: this.ext, http, signal })
       signal?.throwIfAborted()
       signal?.addEventListener('abort', cancel, { once: true })
-      const dialogue = await AVPlayer.DemuxerThread.readEmbeddedAssDialogue(reader.taskId, track.index)
+      const result = await read(reader.taskId)
       signal?.throwIfAborted()
-      if (dialogue === undefined) return
-      return { script: `${header}\n${dialogue}`, fonts }
+      return result
     }
     finally {
       signal?.removeEventListener('abort', cancel)
