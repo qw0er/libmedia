@@ -76,7 +76,8 @@ import {
   logger,
   bigint,
   isWorker,
-  support
+  support,
+  text
 } from '@libmedia/common'
 
 import {
@@ -570,6 +571,33 @@ export default class DemuxPipeline extends Pipeline {
     }
     else {
       logger.fatal('task not found')
+    }
+  }
+
+  /** Read ASS dialogue from an independent demux task that has not started playback. */
+  public async readEmbeddedAssDialogue(taskId: string, streamIndex: number): Promise<string | undefined> {
+    const task = this.tasks.get(taskId)
+    if (!task || task.loop || task.realFormat !== AVFormat.MATROSKA) return
+    const stream = task.formatContext.getStreamByIndex(streamIndex)
+    if (!stream || stream.codecpar.codecType !== AVMediaType.AVMEDIA_TYPE_SUBTITLE
+      || (stream.codecpar.codecId !== AVCodecID.AV_CODEC_ID_ASS && stream.codecpar.codecId !== AVCodecID.AV_CODEC_ID_SSA)) {
+      return
+    }
+
+    const packet = task.avpacketPool.alloc()
+    const dialogue: string[] = []
+    try {
+      while (!(task.ioReader.flags & IOFlags.ABORT)) {
+        const result = await demux.readAVPacket(task.formatContext, packet)
+        if (result === IOError.END) return dialogue.join('\n')
+        if (result < 0) return
+        if (packet.streamIndex === streamIndex) {
+          dialogue.push(text.decode(getAVPacketData(packet)))
+        }
+      }
+    }
+    finally {
+      task.avpacketPool.release(packet)
     }
   }
 

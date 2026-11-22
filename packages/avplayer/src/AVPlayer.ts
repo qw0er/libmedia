@@ -3137,6 +3137,57 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     }
   }
 
+  private getEmbeddedAssStream(id: number) {
+    if (this.formatContext?.format !== AVFormat.MATROSKA || this.isLive_
+      || (typeof this.source !== 'string' && !(this.source instanceof File))
+      || this.externalSubtitleTasks.some((task) => task.streamId === id)) {
+      return
+    }
+    return this.formatContext.streams.find((stream) => stream.id === id
+      && stream.codecpar.codecType === AVMediaType.AVMEDIA_TYPE_SUBTITLE
+      && (stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_ASS || stream.codecpar.codecId === AVCodecID.AV_CODEC_ID_SSA)
+      && stream.codecpar.extradataSize > 0)
+  }
+
+  public canLoadEmbeddedAss(id: number): boolean {
+    return !!this.getEmbeddedAssStream(id)
+  }
+
+  /** Read the selected subtitle without seeking or consuming the playing demux task. */
+  public async loadEmbeddedAss(id: number, { http, signal }: Pick<AVPlayerLoadOptions, 'http' | 'signal'> = {}) {
+    signal?.throwIfAborted()
+    const track = this.getEmbeddedAssStream(id)
+    const source = this.source
+    if (!track || (typeof source !== 'string' && !(source instanceof File))) return
+
+    const header = text.decode(mapUint8Array(track.codecpar.extradata, reinterpret_cast<size>(track.codecpar.extradataSize)))
+    const fonts: Uint8Array[] = []
+    for (const stream of this.formatContext.streams) {
+      if (stream.codecpar.codecType !== AVMediaType.AVMEDIA_TYPE_ATTACHMENT || !stream.codecpar.extradataSize) continue
+      const name = stream.metadata[AVStreamMetadataKey.TITLE] ?? ''
+      const mime = stream.metadata[AVStreamMetadataKey.MIME] ?? ''
+      if (/\.(ttf|otf|ttc|otc)$/i.test(name) || /^(font\/|application\/(x-font-|x-truetype-font|vnd\.ms-opentype|font-sfnt))/i.test(mime)) {
+        fonts.push(mapUint8Array(stream.codecpar.extradata, reinterpret_cast<size>(stream.codecpar.extradataSize)).slice())
+      }
+    }
+
+    const reader = new AVPlayer({ container: document.createElement('div'), enableWorker: this.options.enableWorker })
+    const cancel = () => { void AVPlayer.DemuxerThread.stop(reader.taskId).catch(() => {}) }
+    try {
+      await reader.load(source, { ext: this.ext, http, signal })
+      signal?.throwIfAborted()
+      signal?.addEventListener('abort', cancel, { once: true })
+      const dialogue = await AVPlayer.DemuxerThread.readEmbeddedAssDialogue(reader.taskId, track.index)
+      signal?.throwIfAborted()
+      if (dialogue === undefined) return
+      return { script: `${header}\n${dialogue}`, fonts }
+    }
+    finally {
+      signal?.removeEventListener('abort', cancel)
+      await reader.destroy()
+    }
+  }
+
   /**
    * 获取流信息
    * 
