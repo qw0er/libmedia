@@ -1163,8 +1163,9 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     }
 
     if (this.subtitleRender) {
+      const subtitleTime = timestamp - this.subtitleRender.getDelay()
       for (let i = 0; i < this.externalSubtitleTasks.length; i++) {
-        await AVPlayer.DemuxerThread.seek(this.externalSubtitleTasks[i].taskId, timestamp, AVSeekFlags.FRAME)
+        await AVPlayer.DemuxerThread.seek(this.externalSubtitleTasks[i].taskId, subtitleTime, AVSeekFlags.FRAME)
       }
     }
 
@@ -3063,8 +3064,9 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
       this.seekedTimestamp = seekedTimestamp > timestamp ? seekedTimestamp : timestamp
     }
     if (this.subtitleRender) {
+      const subtitleTime = this.currentTime - this.subtitleRender.getDelay()
       for (let i = 0; i < this.externalSubtitleTasks.length; i++) {
-        await AVPlayer.DemuxerThread.seek(this.externalSubtitleTasks[i].taskId, this.currentTime, AVSeekFlags.FRAME)
+        await AVPlayer.DemuxerThread.seek(this.externalSubtitleTasks[i].taskId, subtitleTime, AVSeekFlags.FRAME)
       }
     }
     if (defined(ENABLE_SUBTITLE_RENDER) && this.subtitleRender) {
@@ -3703,7 +3705,8 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
           return task.streamId === this.selectedSubtitleStream.id
         })
         if (externalTask) {
-          AVPlayer.DemuxerThread.seek(externalTask.taskId, this.currentTime, AVSeekFlags.FRAME)
+          const subtitleTime = this.currentTime - this.subtitleRender.getDelay()
+          AVPlayer.DemuxerThread.seek(externalTask.taskId, subtitleTime, AVSeekFlags.FRAME)
         }
         this.subtitleRender.reset()
         this.subtitleRender.start()
