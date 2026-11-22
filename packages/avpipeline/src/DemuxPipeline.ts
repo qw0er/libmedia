@@ -615,6 +615,22 @@ export default class DemuxPipeline extends Pipeline {
     if (read) return dialogue.join('\n')
   }
 
+  public async readEmbeddedBitmapPackets(taskId: string, streamIndex: number) {
+    const packets: { timeMs: number, durationMs: number, data: Uint8Array }[] = []
+    const timeBase = { num: 1, den: 1000 }
+    const codecs = [AVCodecID.AV_CODEC_ID_DVD_SUBTITLE, AVCodecID.AV_CODEC_ID_DVB_SUBTITLE]
+    const read = await this.readEmbeddedSubtitle(taskId, streamIndex, codecs, (packet) => {
+      if (packet.pts !== NOPTS_VALUE_BIGINT) {
+        packets.push({
+          timeMs: Number(avRescaleQ2(bigint.max(packet.pts, 0n), addressof(packet.timeBase), timeBase)),
+          durationMs: packet.duration > 0n ? Number(avRescaleQ2(packet.duration, addressof(packet.timeBase), timeBase)) : 0,
+          data: getAVPacketData(packet).slice()
+        })
+      }
+    })
+    if (read) return packets
+  }
+
   public async readEmbeddedPgs(taskId: string, streamIndex: number): Promise<Uint8Array | undefined> {
     const segments: Uint8Array[] = []
     const timeBase = { num: 1, den: 90000 }

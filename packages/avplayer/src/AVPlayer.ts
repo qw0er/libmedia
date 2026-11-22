@@ -3172,6 +3172,31 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
     return this.withSubtitleReader(options, (taskId) => AVPlayer.DemuxerThread.readEmbeddedPgs(taskId, track.index))
   }
 
+  public embeddedBitmapSubtitleFormat(id: number): 'pgs' | 'vobsub' | 'dvb' | undefined {
+    const stream = this.getEmbeddedSubtitleStream(id)
+    switch (stream?.codecpar.codecId) {
+      case AVCodecID.AV_CODEC_ID_HDMV_PGS_SUBTITLE:
+        return 'pgs'
+      case AVCodecID.AV_CODEC_ID_DVD_SUBTITLE:
+        return 'vobsub'
+      case AVCodecID.AV_CODEC_ID_DVB_SUBTITLE:
+        return 'dvb'
+    }
+  }
+
+  /** Read subtitle packets with their Matroska timestamps and codec private data. */
+  public async loadEmbeddedBitmapSubtitle(id: number, options: Pick<AVPlayerLoadOptions, 'http' | 'signal'> = {}) {
+    options.signal?.throwIfAborted()
+    const track = this.getEmbeddedSubtitleStream(id)
+    const format = this.embeddedBitmapSubtitleFormat(id)
+    if (!track || (format !== 'vobsub' && format !== 'dvb')) return
+    const codecPrivate = track.codecpar.extradataSize
+      ? mapUint8Array(track.codecpar.extradata, reinterpret_cast<size>(track.codecpar.extradataSize)).slice()
+      : new Uint8Array()
+    const packets = await this.withSubtitleReader(options, (taskId) => AVPlayer.DemuxerThread.readEmbeddedBitmapPackets(taskId, track.index))
+    if (packets?.length) return { format, codecPrivate, packets }
+  }
+
   /** Read the selected subtitle without seeking or consuming the playing demux task. */
   public async loadEmbeddedAss(id: number, options: Pick<AVPlayerLoadOptions, 'http' | 'signal'> = {}) {
     options.signal?.throwIfAborted()
