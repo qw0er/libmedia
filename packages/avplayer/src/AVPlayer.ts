@@ -28,6 +28,7 @@ import {
   DemuxPipeline,
   AudioDecodePipeline,
   VideoDecodePipeline,
+  type VideoDecoderInfo,
   AudioRenderPipeline,
   VideoRenderPipeline,
   Stats
@@ -93,7 +94,9 @@ import {
   IOType,
   IOFlags,
   AVFormat,
+  type AVPixelFormat,
   AVSampleFormat,
+  getAVPixelFormatDescriptor,
   avQ2D,
   avRescaleQ,
   NOPTS_VALUE_BIGINT,
@@ -174,6 +177,8 @@ import { DRMType } from './drm/drm'
 import kid2Base64 from './drm/kid2Base64'
 
 export const Events = eventType
+
+export type VideoDecodeInfo = VideoDecoderInfo | { backend: 'mse' }
 
 const ObjectFitMap = {
   [RenderMode.FILL]: 'cover',
@@ -3247,13 +3252,24 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
    */
   public getStreams() {
     return this.formatContext.streams.map((stream) => {
+      const codecpar = stream.codecpar
+      let videoBitDepth: number | undefined
+      if (codecpar.codecType === AVMediaType.AVMEDIA_TYPE_VIDEO) {
+        videoBitDepth = codecpar.bitsPerRawSample > 0
+          ? codecpar.bitsPerRawSample
+          : getAVPixelFormatDescriptor(codecpar.format as AVPixelFormat)?.comp[0]?.depth
+      }
       return {
         ...stream,
         /**
          * 媒体类型
          */
-        mediaType: dumpUtils.dumpKey(mediaType2AVMediaType, stream.codecpar.codecType),
-        codecparProxy: accessof(stream.codecpar)
+        mediaType: dumpUtils.dumpKey(mediaType2AVMediaType, codecpar.codecType),
+        codecparProxy: accessof(codecpar),
+        codecName: dumpUtils.dumpCodecName(codecpar.codecType, codecpar.codecId),
+        profileName: dumpUtils.dumpProfileName(codecpar.codecId, codecpar.profile, false),
+        attachedPicture: !!this.isAttachmentPicture(stream),
+        videoBitDepth
       }
     })
   }
@@ -3790,6 +3806,20 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
   }
 
   /**
+   * Returns the current video decode backend once playback has started.
+   * WebCodecs reports a preference, since the browser chooses the implementation.
+   */
+  public async getVideoDecodeInfo(): Promise<VideoDecodeInfo | null> {
+    if (this.status < AVPlayerStatus.PLAYED || !this.selectedVideoStream) {
+      return null
+    }
+    if (this.useMSE) {
+      return { backend: 'mse' }
+    }
+    return (await this.VideoDecoderThread?.getDecoderInfo(this.taskId)) ?? null
+  }
+
+  /**
    * 是否是 MediaStream 模式
    */
   public isMediaStreamMode() {
@@ -3884,6 +3914,11 @@ export default class AVPlayer extends Emitter implements ControllerObserver {
    */
   public getFormatContext() {
     return this.formatContext
+  }
+
+  /** Returns the demuxer's container format name after loading. */
+  public getFormatName() {
+    return this.formatContext ? dumpUtils.dumpFormatName(this.formatContext.format) : 'unknown'
   }
 
   /**

@@ -36,6 +36,7 @@ export {
 export {
   type VideoDecodeTaskInfo,
   type VideoDecodeTaskOptions,
+  type VideoDecoderInfo,
   default as VideoDecodePipeline
 } from './VideoDecodePipeline'
 

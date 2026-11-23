@@ -123,20 +123,20 @@ export function dumpFormatName(format: AVFormat) {
   return dumpKey(stringEnum.Format2AVFormat, format)
 }
 
-export function dumpProfileName(codecId: AVCodecID, profile: int32) {
+export function dumpProfileName(codecId: AVCodecID, profile: int32, useDefault = true) {
   switch (codecId) {
     case AVCodecID.AV_CODEC_ID_AAC:
-      return aac.AACProfile2Name[profile] || 'LC'
+      return aac.AACProfile2Name[profile] ?? (useDefault ? 'LC' : undefined)
     case AVCodecID.AV_CODEC_ID_MP3:
-      return mp3.MP3Profile2Name[profile] || 'Layer3'
+      return mp3.MP3Profile2Name[profile] ?? (useDefault ? 'Layer3' : undefined)
     case AVCodecID.AV_CODEC_ID_H264:
-      return h264.H264Profile2Name[profile] || 'High'
+      return h264.H264Profile2Name[profile] ?? (useDefault ? 'High' : undefined)
     case AVCodecID.AV_CODEC_ID_HEVC:
-      return hevc.HEVCProfile2Name[profile] || 'Main'
+      return hevc.HEVCProfile2Name[profile] ?? (useDefault ? 'Main' : undefined)
     case AVCodecID.AV_CODEC_ID_AV1:
-      return av1.AV1Profile2Name[profile] || 'Main'
+      return av1.AV1Profile2Name[profile] ?? (useDefault ? 'Main' : undefined)
     case AVCodecID.AV_CODEC_ID_VP9:
-      return vp9.VP9Profile2Name[profile] || 'Profile0'
+      return vp9.VP9Profile2Name[profile] ?? (useDefault ? 'Profile0' : undefined)
   }
 }
 

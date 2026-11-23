@@ -156,6 +156,10 @@ export interface VideoDecodeTaskInfo {
   hardware: boolean
 }
 
+export type VideoDecoderInfo =
+  | { backend: 'wasm' }
+  | { backend: 'webcodecs', hardwareAcceleration: 'prefer-hardware' | 'prefer-software' }
+
 export default class VideoDecodePipeline extends Pipeline {
 
   declare tasks: Map<string, SelfTask>
@@ -178,6 +182,7 @@ export default class VideoDecodePipeline extends Pipeline {
           else if (task.targetDecoder === task.softwareDecoder) {
             task.softwareDecoder.close()
             task.softwareDecoder = this.createWasmcodecDecoder(task, task.resource)
+            task.targetDecoder = task.softwareDecoder
             task.softwareDecoderOpened = false
             task.decoderFallbackReady = this.openSoftwareDecoder(task)
             logger.warn(`video decode error by software(webcodecs) decoder(${task.hardwareRetryCount}), taskId: ${task.taskId}, error: ${error}, try to fallback to software(wasm) decoder`)
@@ -916,6 +921,23 @@ export default class VideoDecodePipeline extends Pipeline {
       this.tasks.delete(taskId)
       logger.debug(`unregisterTask task, taskId: ${taskId}`)
     }
+  }
+
+  public async getDecoderInfo(taskId: string): Promise<VideoDecoderInfo | null> {
+    const task = this.tasks.get(taskId)
+    if (!task?.targetDecoder) {
+      return null
+    }
+    if (task.targetDecoder === task.hardwareDecoder) {
+      return { backend: 'webcodecs', hardwareAcceleration: 'prefer-hardware' }
+    }
+    if (task.targetDecoder !== task.softwareDecoder || !task.softwareDecoderOpened) {
+      return null
+    }
+    if (task.targetDecoder instanceof WebVideoDecoder) {
+      return { backend: 'webcodecs', hardwareAcceleration: 'prefer-software' }
+    }
+    return { backend: 'wasm' }
   }
 
   public async getTasksInfo() {
