@@ -45,56 +45,92 @@ import {
 
 const RestExt = ['php', 'asp', 'aspx', 'jsp', 'do', 'pl']
 
-async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}, signal?: AbortSignal) {
-  const params: RequestInit = {
-    method: 'GET',
-    headers: {},
-    mode: 'cors',
-    cache: 'default',
-    referrerPolicy: 'no-referrer-when-downgrade'
+async function sleepWithAbort(ms: number, signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw signal.reason
   }
-  if (httpOptions.headers) {
-    object.each(httpOptions.headers, (value, key) => {
-      params.headers[key] = value
-    })
-  }
-  if (httpOptions.credentials) {
-    params.credentials = httpOptions.credentials
-  }
-  if (httpOptions.referrerPolicy) {
-    params.referrerPolicy = httpOptions.referrerPolicy
-  }
-  params.signal = signal
-  const res = await fetch(url, params)
-  if (res.ok && (res.status >= 200 && res.status <= 299)) {
-    const reader = res.body.getReader()
-    const buffers: Uint8Array[] = []
-    let len = 0
-    while (true) {
-      let result = await reader.read()
-      if (result.done) {
-        break
-      }
-      len += result.value.length
-      buffers.push(result.value)
-      if (len >= 100) {
-        break
-      }
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(signal?.reason)
     }
-    void reader.cancel().catch(() => {})
-    if (buffers.length) {
-      const buffer = buffers.length > 1 ? concatTypeArray(Uint8Array, buffers) : buffers[0]
-      if (buffer.length) {
-        const context = text.decode(buffer.subarray(0, 100))
-        if (/<\?xml/.test(context)) {
-          if (context.indexOf('<MPD') > -1) {
-            return 'mpd'
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function analyzeUrlFileExt(url: string, httpOptions: HttpOptions = {}, signal?: AbortSignal) {
+  const maxAttempts = 3
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const params: RequestInit = {
+      method: 'GET',
+      headers: {},
+      mode: 'cors',
+      cache: 'default',
+      referrerPolicy: 'no-referrer-when-downgrade'
+    }
+    let hasRange = false
+    if (httpOptions.headers) {
+      object.each(httpOptions.headers, (value, key) => {
+        params.headers[key] = value
+        if (key.toLowerCase() === 'range') {
+          hasRange = true
+        }
+      })
+    }
+    if (!hasRange) {
+      params.headers['range'] = 'bytes=0-1023'
+    }
+    if (httpOptions.credentials) {
+      params.credentials = httpOptions.credentials
+    }
+    if (httpOptions.referrerPolicy) {
+      params.referrerPolicy = httpOptions.referrerPolicy
+    }
+    params.signal = signal
+    try {
+      const res = await fetch(url, params)
+      if (res.ok && (res.status >= 200 && res.status <= 299)) {
+        const reader = res.body.getReader()
+        const buffers: Uint8Array[] = []
+        let len = 0
+        while (true) {
+          let result = await reader.read()
+          if (result.done) {
+            break
+          }
+          len += result.value.length
+          buffers.push(result.value)
+          if (len >= 100) {
+            break
           }
         }
-        else if (/#EXTM3U/.test(context)) {
-          return 'm3u8'
+        void reader.cancel().catch(() => {})
+        if (buffers.length) {
+          const buffer = buffers.length > 1 ? concatTypeArray(Uint8Array, buffers) : buffers[0]
+          if (buffer.length) {
+            const context = text.decode(buffer.subarray(0, 100))
+            if (/<\?xml/.test(context)) {
+              if (context.indexOf('<MPD') > -1) {
+                return 'mpd'
+              }
+            }
+            else if (/#EXTM3U/.test(context)) {
+              return 'm3u8'
+            }
+          }
         }
       }
+      return ''
+    }
+    catch (error) {
+      if (signal?.aborted || attempt + 1 >= maxAttempts) {
+        throw error
+      }
+      await sleepWithAbort(500, signal)
     }
   }
   return ''

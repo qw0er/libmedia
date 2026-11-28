@@ -1050,6 +1050,10 @@ export default class IMpegpsFormat extends IFormat {
       return await this.readAVPacket_(formatContext, avpacket)
     }
     catch (error) {
+      if (formatContext.ioReader.error === IOError.NETWORK_ERROR) {
+        logger.error(`read packet error, ${error}`)
+        return formatContext.ioReader.error
+      }
       if (formatContext.ioReader.error !== IOError.END
         && formatContext.ioReader.error !== IOError.ABORT
       ) {

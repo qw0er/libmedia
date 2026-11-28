@@ -32,6 +32,10 @@ import {
 } from '@libmedia/common'
 
 import {
+  IOError
+} from '@libmedia/common/io'
+
+import {
   type RpcMessage,
   IPCPort,
   REQUEST
@@ -169,7 +173,9 @@ export default class IOPipeline extends Pipeline {
 
           try {
             const len = await ioLoader.read(buffer, ioloaderOptions)
-            task.stats.bufferReceiveBytes += static_cast<int64>(len)
+            if (len > 0) {
+              task.stats.bufferReceiveBytes += static_cast<int64>(len)
+            }
             ipcPort.reply(request, len)
           }
           catch (error) {
@@ -177,7 +183,10 @@ export default class IOPipeline extends Pipeline {
               return
             }
             logger.error(`loader read error, ${error}, taskId: ${options.taskId}`)
-            ipcPort.reply(request, errorType.DATA_INVALID)
+            const code = task.type === IOType.File
+              ? errorType.DATA_INVALID
+              : IOError.NETWORK_ERROR
+            ipcPort.reply(request, code)
           }
 
           break

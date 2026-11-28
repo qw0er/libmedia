@@ -266,6 +266,7 @@ export default class IWebVttFormat extends IFormat {
         catch (error) {
           if (formatContext.ioReader.error !== IOError.END
             && formatContext.ioReader.error !== IOError.ABORT
+            && formatContext.ioReader.error !== IOError.NETWORK_ERROR
           ) {
             logger.error(`read cue error, ${error}`)
             return errorType.DATA_INVALID

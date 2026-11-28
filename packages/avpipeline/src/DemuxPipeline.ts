@@ -358,7 +358,7 @@ export default class DemuxPipeline extends Pipeline {
         }
       }
       catch (error) {
-        return errorType.DATA_INVALID
+        return task.ioReader.error < 0 ? task.ioReader.error : errorType.DATA_INVALID
       }
 
       let iformat: IFormat

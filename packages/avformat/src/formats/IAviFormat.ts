@@ -1096,6 +1096,7 @@ export default class IAviFormat extends IFormat {
     catch (error) {
       if (formatContext.ioReader.error !== IOError.END
           && formatContext.ioReader.error !== IOError.ABORT
+          && formatContext.ioReader.error !== IOError.NETWORK_ERROR
       ) {
         logger.error(`read packet error, ${error}`)
         return errorType.DATA_INVALID
@@ -1186,6 +1187,7 @@ export default class IAviFormat extends IFormat {
       catch (error) {
         if (formatContext.ioReader.error !== IOError.END
           && formatContext.ioReader.error !== IOError.ABORT
+          && formatContext.ioReader.error !== IOError.NETWORK_ERROR
         ) {
           logger.error(`read packet error, ${error}`)
           return errorType.DATA_INVALID

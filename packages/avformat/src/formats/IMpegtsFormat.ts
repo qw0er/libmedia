@@ -603,6 +603,7 @@ export default class IMpegtsFormat extends IFormat {
         }
         else if (formatContext.ioReader.error === IOError.END
           || formatContext.ioReader.error === IOError.ABORT
+          || formatContext.ioReader.error === IOError.NETWORK_ERROR
         ) {
           return formatContext.ioReader.error
         }
